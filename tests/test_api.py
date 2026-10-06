@@ -4,6 +4,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import re
+import sqlite3
 import zipfile
 from datetime import datetime
 
@@ -13,13 +16,15 @@ from pydicom import dcmread
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, JPEGBaseline
 
-from app.config import Settings
+from app.config import Settings, secret_fingerprint
 from app.dicom_ops import UIDMapper, compute_offset
 from app.engine import anonymize_zip
 from app.main import create_app
 from app.policy import canonical_json
 
 SECRET = "test-secret"
+SECRET_A = "rotated-secret-A"
+SECRET_B = "rotated-secret-B"
 BASE_POLICY = {
     "version": "1.0",
     "salt": "unit-test",
@@ -630,6 +635,181 @@ def test_different_policy_changes_output():
     _, result1, _, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
     _, result2, _, _ = anonymize_zip(payload, other_policy, None, SECRET)
     assert result1 != result2
+
+
+# ---------------------------------------------------------------------------
+# Secret rotation: job deduplication is scoped to the anonymization key
+# ---------------------------------------------------------------------------
+def post_job_raw(client, zip_bytes, policy, redactions=None):
+    data = {"policy": json.dumps(policy)}
+    if redactions is not None:
+        data["redactions"] = json.dumps(redactions)
+    return client.post(
+        "/jobs",
+        files={"file": ("input.zip", zip_bytes, "application/zip")},
+        data=data,
+    )
+
+
+def test_secret_fingerprint_is_stable_distinct_and_opaque():
+    assert secret_fingerprint(SECRET_A) == secret_fingerprint(SECRET_A)
+    assert secret_fingerprint(SECRET_A) != secret_fingerprint(SECRET_B)
+    assert re.fullmatch(r"[0-9a-f]{64}", secret_fingerprint(SECRET_A))
+    # digest only: neither the secret nor fragments of it leak through
+    assert SECRET_A not in secret_fingerprint(SECRET_A)
+    assert SECRET_A.encode() not in bytes.fromhex(secret_fingerprint(SECRET_A))
+
+
+def test_rotated_secret_creates_independent_job_with_new_audit_and_hash(tmp_path):
+    payload = three_instance_zip()
+
+    with TestClient(create_app(Settings(data_dir=str(tmp_path), secret=SECRET_A))) as client_a:
+        first = post_job_raw(client_a, payload, BASE_POLICY)
+        assert first.status_code == 202
+        job_a = first.json()["job_id"]
+        assert re.fullmatch(r"[0-9a-f]{32}", job_a)
+        assert first.json()["key_fingerprint"] == secret_fingerprint(SECRET_A)
+        status_a = get_job(client_a, job_a)
+        assert status_a["status"] == "done"
+        assert status_a["key_fingerprint"] == secret_fingerprint(SECRET_A)
+        zip_a = download(client_a, job_a)
+        hash_a = hashlib.sha256(zip_a).hexdigest()
+
+    # restart with the *same* secret over the persisted data dir: identical
+    # submission must still be deduplicated (200 + same job)
+    with TestClient(create_app(Settings(data_dir=str(tmp_path), secret=SECRET_A))) as client_a2:
+        reuse = post_job_raw(client_a2, payload, BASE_POLICY)
+        assert reuse.status_code == 200
+        assert reuse.json()["job_id"] == job_a
+        assert reuse.json()["key_fingerprint"] == secret_fingerprint(SECRET_A)
+
+    # restart with a *new* secret and resubmit byte-for-byte identical input:
+    # the old record must not be reused — a new job under key B is required
+    with TestClient(create_app(Settings(data_dir=str(tmp_path), secret=SECRET_B))) as client_b:
+        rotated = post_job_raw(client_b, payload, BASE_POLICY)
+        assert rotated.status_code == 202, rotated.text
+        job_b = rotated.json()["job_id"]
+        assert job_b != job_a
+        assert rotated.json()["key_fingerprint"] == secret_fingerprint(SECRET_B)
+
+        status_b = get_job(client_b, job_b)
+        assert status_b["status"] == "done"
+        assert status_b["key_fingerprint"] == secret_fingerprint(SECRET_B)
+        zip_b = download(client_b, job_b)
+        hash_b = hashlib.sha256(zip_b).hexdigest()
+
+        # B really produced its own anonymized output, not A's bytes
+        assert hash_b != hash_a
+        assert status_b["audit"]["output"]["zip_sha256"] == hash_b
+        assert status_a["audit"]["output"]["zip_sha256"] == hash_a
+        assert status_b["audit"]["key_fingerprint"] == secret_fingerprint(SECRET_B)
+        assert (
+            status_b["audit"]["uid_mapping"]
+            != status_a["audit"]["uid_mapping"]
+        )
+
+        # resubmitting under B is still idempotent
+        again = post_job_raw(client_b, payload, BASE_POLICY)
+        assert again.status_code == 200
+        assert again.json()["job_id"] == job_b
+
+        # the A job stays queryable and downloadable after rotation ...
+        legacy = client_b.get(f"/jobs/{job_a}")
+        assert legacy.status_code == 200
+        assert legacy.json()["status"] == "done"
+        assert legacy.json()["key_fingerprint"] == secret_fingerprint(SECRET_A)
+        legacy_zip = client_b.get(f"/jobs/{job_a}/download")
+        assert legacy_zip.status_code == 200
+        assert hashlib.sha256(legacy_zip.content).hexdigest() == hash_a
+        # ... and its manifest advertises the fingerprint of the key that made it
+        manifest = json.loads(zipfile.ZipFile(io.BytesIO(zip_a)).read("manifest.json"))
+        assert manifest["key_fingerprint"] == secret_fingerprint(SECRET_A)
+        manifest_b = json.loads(zipfile.ZipFile(io.BytesIO(zip_b)).read("manifest.json"))
+        assert manifest_b["key_fingerprint"] == secret_fingerprint(SECRET_B)
+
+
+def test_legacy_records_without_fingerprint_remain_accessible_but_are_never_reused(tmp_path):
+    """Database written by the pre-rotation build (no key_fingerprint column,
+    legacy job id): on startup the schema migrates, the old job keeps working,
+    and the same submission under the new key creates a separate job instead
+    of returning the old secret's result."""
+    payload = three_instance_zip()
+
+    def legacy_job_id(input_sha256):
+        # job-id formula as it shipped before key scoping
+        digest = hashlib.sha256()
+        digest.update(input_sha256.encode())
+        digest.update(b"|")
+        digest.update(canonical_json(BASE_POLICY).encode())
+        digest.update(b"|")
+        digest.update(canonical_json(None).encode())
+        return digest.hexdigest()[:32]
+
+    input_sha = hashlib.sha256(payload).hexdigest()
+    old_id = legacy_job_id(input_sha)
+
+    # produce a real result under secret A through the current engine
+    errors, result_bytes, audit, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET_A)
+    assert errors == []
+    os.makedirs(tmp_path / "results", exist_ok=True)
+    result_path = tmp_path / "results" / f"{old_id}.zip"
+    result_path.write_bytes(result_bytes)
+
+    # hand-write the old (pre-migration) schema
+    db = sqlite3.connect(tmp_path / "jobs.db")
+    db.execute(
+        "CREATE TABLE jobs ("
+        "job_id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL,"
+        " updated_at TEXT NOT NULL, policy_json TEXT NOT NULL, redactions_json TEXT,"
+        " input_sha256 TEXT NOT NULL, result_path TEXT, result_sha256 TEXT,"
+        " audit_json TEXT, errors_json TEXT)"
+    )
+    db.execute(
+        "INSERT INTO jobs VALUES (?, 'done', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',"
+        " ?, NULL, ?, ?, ?, ?, NULL)",
+        (
+            old_id,
+            json.dumps(BASE_POLICY),
+            input_sha,
+            str(result_path),
+            hashlib.sha256(result_bytes).hexdigest(),
+            json.dumps(audit),
+        ),
+    )
+    db.commit()
+    db.close()
+
+    with TestClient(create_app(Settings(data_dir=str(tmp_path), secret=SECRET_B))) as client:
+        # migration added the column; the legacy row has a NULL fingerprint
+        with sqlite3.connect(tmp_path / "jobs.db") as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+            assert "key_fingerprint" in cols
+            stored_fp = conn.execute(
+                "SELECT key_fingerprint FROM jobs WHERE job_id = ?", (old_id,)
+            ).fetchone()[0]
+            assert stored_fp is None
+
+        # old id still resolves and its bytes (made by A) still download
+        legacy = client.get(f"/jobs/{old_id}")
+        assert legacy.status_code == 200
+        assert legacy.json()["key_fingerprint"] is None
+        dl = client.get(f"/jobs/{old_id}/download")
+        assert dl.status_code == 200
+        assert dl.content == result_bytes
+
+        # identical resubmission under B must not hit the legacy A record
+        resubmit = post_job_raw(client, payload, BASE_POLICY)
+        assert resubmit.status_code == 202, resubmit.text
+        new_id = resubmit.json()["job_id"]
+        assert new_id != old_id
+        assert resubmit.json()["key_fingerprint"] == secret_fingerprint(SECRET_B)
+
+        new_status = get_job(client, new_id)
+        assert new_status["status"] == "done"
+        new_zip = download(client, new_id)
+        assert hashlib.sha256(new_zip).hexdigest() != hashlib.sha256(result_bytes).hexdigest()
+        # B's UID mapping differs from the A-produced legacy result
+        assert new_status["audit"]["key_fingerprint"] == secret_fingerprint(SECRET_B)
 
 
 # ---------------------------------------------------------------------------

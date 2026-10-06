@@ -9,17 +9,18 @@ from typing import Any, Optional
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id         TEXT PRIMARY KEY,
-    status         TEXT NOT NULL,
-    created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL,
-    policy_json    TEXT NOT NULL,
+    job_id          TEXT PRIMARY KEY,
+    status          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    policy_json     TEXT NOT NULL,
     redactions_json TEXT,
-    input_sha256   TEXT NOT NULL,
-    result_path    TEXT,
-    result_sha256  TEXT,
-    audit_json     TEXT,
-    errors_json    TEXT
+    input_sha256    TEXT NOT NULL,
+    key_fingerprint TEXT,
+    result_path     TEXT,
+    result_sha256   TEXT,
+    audit_json      TEXT,
+    errors_json     TEXT
 );
 """
 
@@ -35,13 +36,34 @@ class JobStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            self._migrate()
 
-    def create(self, job_id: str, policy: dict, redactions: Any, input_sha256: str) -> None:
+    def _migrate(self) -> None:
+        """Add columns introduced after the first schema revision.
+
+        Rows written by older builds get NULL ``key_fingerprint``: their
+        result was produced by an unknown, since-rotated secret, so they are
+        kept for query/download but can never satisfy a new deduplication
+        lookup (new job ids carry the fingerprint of the current secret).
+        """
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if "key_fingerprint" not in columns:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN key_fingerprint TEXT")
+
+    def create(
+        self,
+        job_id: str,
+        policy: dict,
+        redactions: Any,
+        input_sha256: str,
+        key_fingerprint: str,
+    ) -> None:
         now = _utcnow()
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO jobs (job_id, status, created_at, updated_at, policy_json,"
-                " redactions_json, input_sha256) VALUES (?, 'queued', ?, ?, ?, ?, ?)",
+                " redactions_json, input_sha256, key_fingerprint) "
+                "VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)",
                 (
                     job_id,
                     now,
@@ -49,6 +71,7 @@ class JobStore:
                     json.dumps(policy),
                     json.dumps(redactions) if redactions is not None else None,
                     input_sha256,
+                    key_fingerprint,
                 ),
             )
 

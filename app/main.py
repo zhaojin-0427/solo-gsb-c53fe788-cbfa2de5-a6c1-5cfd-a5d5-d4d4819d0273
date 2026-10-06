@@ -28,9 +28,22 @@ Anonymize multi-series DICOM ZIP archives for research use.
 """
 
 
-def compute_job_id(input_sha256: str, policy: dict, redactions: Optional[list]) -> str:
-    """Idempotent job id: identical submissions map to the same job."""
+def compute_job_id(input_sha256: str, policy: dict, redactions: Optional[list], key_fingerprint: str) -> str:
+    """Idempotent job id, scoped to the anonymization key.
+
+    Identical submissions under the same secret map to the same job; after an
+    ``ANON_SECRET`` rotation the key fingerprint changes, so the resubmission
+    gets its own job (fresh engine run, independent audit and output hash)
+    instead of silently reusing the previous secret's result.
+
+    The ``v2`` domain prefix prevents new ids from ever colliding with legacy
+    32-hex-char ids created before key scoping existed; those records have no
+    recorded fingerprint and remain queryable/downloadable by their old id.
+    """
     digest = hashlib.sha256()
+    digest.update(b"dicom-anon-job:v2|")
+    digest.update(key_fingerprint.encode("utf-8"))
+    digest.update(b"|")
     digest.update(input_sha256.encode("utf-8"))
     digest.update(b"|")
     digest.update(canonical_json(policy).encode("utf-8"))
@@ -49,6 +62,7 @@ def job_status_payload(record: dict) -> dict:
         "policy_version": policy.get("version"),
         "policy_sha256": policy_sha256(policy),
         "input_sha256": record["input_sha256"],
+        "key_fingerprint": record["key_fingerprint"],
     }
     if record["status"] == "failed":
         payload["errors"] = json.loads(record["errors_json"] or "[]")
@@ -99,7 +113,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 raise HTTPException(400, f"redactions is not valid JSON: {exc}")
 
         input_sha256 = hashlib.sha256(content).hexdigest()
-        job_id = compute_job_id(input_sha256, policy_obj, redactions_obj)
+        job_id = compute_job_id(input_sha256, policy_obj, redactions_obj, settings.key_fingerprint)
         existing = store.get(job_id)
         if existing:
             return JSONResponse(
@@ -109,13 +123,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "status": existing["status"],
                     "status_url": f"/jobs/{job_id}",
                     "detail": "identical submission already exists; returning the existing job",
+                    "key_fingerprint": settings.key_fingerprint,
                 },
             )
-        store.create(job_id, policy_obj, redactions_obj, input_sha256)
+        store.create(job_id, policy_obj, redactions_obj, input_sha256, settings.key_fingerprint)
         background_tasks.add_task(
             process_job, store, results_dir, settings.secret, job_id, content, policy_obj, redactions_obj
         )
-        return JobCreated(job_id=job_id, status="queued", status_url=f"/jobs/{job_id}")
+        return JobCreated(
+            job_id=job_id,
+            status="queued",
+            status_url=f"/jobs/{job_id}",
+            key_fingerprint=settings.key_fingerprint,
+        )
 
     @app.get("/jobs/{job_id}", response_model=JobStatus)
     def get_job(job_id: str):

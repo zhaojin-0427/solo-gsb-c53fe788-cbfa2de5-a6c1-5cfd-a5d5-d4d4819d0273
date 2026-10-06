@@ -18,6 +18,9 @@ class JobCreated(BaseModel):
     status: str
     status_url: str
     detail: Optional[str] = None
+    #: SHA-256 fingerprint of the ANON_SECRET the job is scoped to
+    #: (never the secret itself); null only for records predating key scoping.
+    key_fingerprint: Optional[str] = None
 
 
 class ResultInfo(BaseModel):
@@ -34,6 +37,7 @@ class JobStatus(BaseModel):
     policy_version: Optional[str] = None
     policy_sha256: str
     input_sha256: str
+    key_fingerprint: Optional[str] = None
     errors: Optional[list[ErrorItem]] = None
     audit: Optional[dict[str, Any]] = None
     result: Optional[ResultInfo] = None

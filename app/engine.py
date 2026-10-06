@@ -23,6 +23,7 @@ from pydicom.multival import MultiValue
 from pydicom.uid import ExplicitVRLittleEndian, ImplicitVRLittleEndian
 
 from . import dicom_ops
+from .config import secret_fingerprint
 from .policy import canonical_json, compile_actions, policy_sha256, validate_policy
 
 GENERATOR = "dicom-anon-api 1.0.0"
@@ -403,6 +404,7 @@ def anonymize_zip(
 
     # ---- transform (all-or-nothing, in memory) -----------------------------
     key = hashlib.sha256(f"{secret}|{canonical_json(policy)}".encode("utf-8")).digest()
+    key_fp = secret_fingerprint(secret)
     mapper = dicom_ops.UIDMapper(key)
     actions = compile_actions(policy)
     remove_private = policy.get("remove_private_tags", True)
@@ -465,6 +467,7 @@ def anonymize_zip(
         "policy_version": policy.get("version"),
         "policy_sha256": policy_sha256(policy),
         "input_sha256": input_sha256,
+        "key_fingerprint": key_fp,
         "files": manifest_files,
     }
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -477,6 +480,7 @@ def anonymize_zip(
         "policy_version": policy.get("version"),
         "policy_sha256": policy_sha256(policy),
         "input": {"zip_sha256": input_sha256, "instances": len(instances)},
+        "key_fingerprint": key_fp,
         "output": {"zip_sha256": result_sha256, "files": manifest_files},
         "summary": {
             "studies": len(studies),

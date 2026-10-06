@@ -23,9 +23,11 @@
   （固定 ZIP 时间戳、确定性文件命名、确定性 DICOM 编码、HMAC 派生映射）。
 - **全有或全无**：缺失引用、非法 VR、压缩像素、策略冲突等逐项报告，
   任一错误即整体失败，绝不产出半成品。
-- **审计与可复验哈希**：结果附审计摘要（统计、UID 映射、警告）及
+- **审计与可复验哈希**：结果附审计摘要（统计、UID 映射、警告、密钥指纹）及
   输出 ZIP 与逐文件 SHA-256；ZIP 内含 `manifest.json` 供离线复验。
-- **幂等提交**：相同输入 + 策略的重复提交返回同一作业（HTTP 200）。
+- **幂等提交按密钥作用域隔离**：相同输入 + 策略在**同一 `ANON_SECRET`** 下
+  重复提交返回同一作业（HTTP 200）；轮换密钥后原样重提会得到**独立的新作业、
+  审计与结果哈希**，绝不会把旧密钥的产物当作新密钥的结果返回。
 
 ## 快速开始（Docker Compose）
 
@@ -39,8 +41,12 @@ docker compose up --build
 - 健康检查：`GET /healthz`
 - 策略说明：`GET /policies`
 
+作业库（SQLite）与结果 ZIP 持久化在命名卷 `dicom-anon-data`（容器内
+`/data`），重启容器不会丢失；下文的密钥轮换演练正是在这份持久化数据上进行。
+
 > 生产部署请设置稳定的 `ANON_SECRET`（环境变量或 `.env` 文件），
 > 它是 UID 映射 / 日期偏移 / 哈希的 HMAC 根密钥；变更后映射结果会改变。
+> 服务只持久化密钥的 **SHA-256 指纹**（见下文「密钥轮换」），永不保存明文。
 
 ## 本地开发
 
@@ -48,7 +54,7 @@ docker compose up --build
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
-pytest tests/ -q          # 32 项测试
+pytest tests/ -q          # 35 项测试（含密钥轮换与旧库迁移）
 ```
 
 ## 示例请求
@@ -78,15 +84,23 @@ curl -s -X POST http://localhost:8000/jobs \
   -F "redactions=<examples/redactions.json"
 ```
 
-响应（HTTP 202；重复提交返回 200 与同一 `job_id`）：
+响应（HTTP 202；同一密钥下重复提交返回 200 与同一 `job_id`）：
 
 ```json
-{ "job_id": "bf15134291c77befb7fcd26b0b33bcb9", "status": "queued",
-  "status_url": "/jobs/bf15134291c77befb7fcd26b0b33bcb9", "detail": null }
+{
+  "job_id": "3c9dbb7bdbef949d934381f8733e2c1e",
+  "status": "queued",
+  "status_url": "/jobs/3c9dbb7bdbef949d934381f8733e2c1e",
+  "detail": null,
+  "key_fingerprint": "c5c66dd438c0ba919018ab9a3bd2314610848dc84b2cd59b0d6a09ccb27c3b05"
+}
 ```
 
+`key_fingerprint` 是当前 `ANON_SECRET` 的 SHA-256 指纹（非明文密钥）：
+作业判重与引擎 HMAC 用的是同一个密钥作用域。
+
 > 下列示例数值用 `docker compose` 的默认 `ANON_SECRET=change-me-in-production`
-> 实跑采集；设置了其他密钥时 `job_id`、映射 UID 与哈希会不同。重新生成的
+> 实跑采集；设置了其他密钥时 `job_id`、指纹、映射 UID 与哈希会不同。重新生成的
 > `sample_input.zip` 与示例策略字节固定，所以同一密钥下结果可逐字节复验。
 
 ### 3. 查询状态与审计摘要
@@ -99,12 +113,14 @@ curl -s http://localhost:8000/jobs/<job_id>
 
 ```json
 {
-  "job_id": "bf15134291c77befb7fcd26b0b33bcb9",
+  "job_id": "3c9dbb7bdbef949d934381f8733e2c1e",
   "status": "done",
   "policy_version": "1.0",
   "policy_sha256": "1c0d2dd6424dc99a890d877fd54488fca69367c8eea49437ed191c79b37d8175",
   "input_sha256": "2bcc31fa707c4b9c50a71781cde5a2b24abe9dd20ded1eb0b651bf222760739e",
+  "key_fingerprint": "c5c66dd438c0ba919018ab9a3bd2314610848dc84b2cd59b0d6a09ccb27c3b05",
   "audit": {
+    "key_fingerprint": "c5c66dd438c0ba919018ab9a3bd2314610848dc84b2cd59b0d6a09ccb27c3b05",
     "summary": { "studies": 1, "series": 2, "instances": 4,
                  "uids_mapped": 7, "tags_removed": 4, "tags_emptied": 52,
                  "tags_replaced": 8, "tags_hashed": 4,
@@ -114,7 +130,7 @@ curl -s http://localhost:8000/jobs/<job_id>
       "1.2.826.0.1.3680043.9.7433.1.1":     "2.25.303989340376998048752381211511128573336",
       "1.2.826.0.1.3680043.9.7433.1.1.1":   "2.25.93670731803630432347505141810977829969"
     },
-    "output": { "zip_sha256": "8b487ea8372293ee0c23a79d4061afb060391c9bc5446c03718a440ac0c4b814",
+    "output": { "zip_sha256": "855651eb6aa3d79d1a85c36e4ff4feb63642bc5ee9b4d48304799b9e4b96566d",
                 "files": [
       { "path": "STUDY_0001/SERIES_0001/INSTANCE_00001.dcm",
         "sha256": "02d822b43a7cb63f0e04eb80e0564eeb8a855220fa8f698e56de4cd7811efa97",
@@ -122,9 +138,9 @@ curl -s http://localhost:8000/jobs/<job_id>
         "series_instance_uid": "2.25.93670731803630432347505141810977829969",
         "sop_instance_uid":    "2.25.145337988595756024462092823072960691239" } ] }
   },
-  "result": { "sha256": "8b487ea8372293ee0c23a79d4061afb060391c9bc5446c03718a440ac0c4b814",
-              "size_bytes": 15990,
-              "download_url": "/jobs/bf15134291c77befb7fcd26b0b33bcb9/download" }
+  "result": { "sha256": "855651eb6aa3d79d1a85c36e4ff4feb63642bc5ee9b4d48304799b9e4b96566d",
+              "size_bytes": 16045,
+              "download_url": "/jobs/3c9dbb7bdbef949d934381f8733e2c1e/download" }
 }
 ```
 
@@ -148,10 +164,10 @@ curl -s http://localhost:8000/jobs/<job_id>
 ### 4. 下载并复验
 
 ```bash
-curl -s -OJ http://localhost:8000/jobs/bf15134291c77befb7fcd26b0b33bcb9/download
-sha256sum anonymized-bf15134291c77befb7fcd26b0b33bcb9.zip
-# 8b487ea8…c4b814  anonymized-…zip  —— 与 result.sha256 / audit.output.zip_sha256 一致
-unzip -p anonymized-bf15134291c77befb7fcd26b0b33bcb9.zip manifest.json   # 逐文件 SHA-256 与映射后 UID
+curl -s -OJ http://localhost:8000/jobs/3c9dbb7bdbef949d934381f8733e2c1e/download
+sha256sum anonymized-3c9dbb7bdbef949d934381f8733e2c1e.zip
+# 855651eb…6566d  anonymized-…zip  —— 与 result.sha256 / audit.output.zip_sha256 一致
+unzip -p anonymized-3c9dbb7bdbef949d934381f8733e2c1e.zip manifest.json   # 逐文件 SHA-256、映射后 UID 与 key_fingerprint
 ```
 
 可用 pydicom 直接确认多层 SQ 的清洗结果：
@@ -159,7 +175,7 @@ unzip -p anonymized-bf15134291c77befb7fcd26b0b33bcb9.zip manifest.json   # 逐�
 ```python
 from pydicom import dcmread
 import io, zipfile
-zf = zipfile.ZipFile("anonymized-bf15134291c77befb7fcd26b0b33bcb9.zip")
+zf = zipfile.ZipFile("anonymized-3c9dbb7bdbef949d934381f8733e2c1e.zip")
 ds = dcmread(io.BytesIO(zf.read("STUDY_0001/SERIES_0001/INSTANCE_00001.dcm")))
 assert "RequestAttributesSequence" not in ds                 # 整条移除
 leaf = (ds.VerifyingObserverSequence[0]
@@ -173,11 +189,107 @@ assert str(leaf.ReferencedSOPSequence[0].ReferencedSOPInstanceUID).startswith("2
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/jobs` | 提交作业（multipart：`file` ZIP、`policy` JSON 字符串、`redactions` 可选 JSON 数组）。幂等：相同输入返回既有作业 |
-| `GET` | `/jobs/{id}` | 查询状态 / 逐项错误 / 审计摘要 / 结果哈希 |
-| `GET` | `/jobs/{id}/download` | 下载匿名化结果 ZIP（未完成返回 409） |
+| `POST` | `/jobs` | 提交作业（multipart：`file` ZIP、`policy` JSON 字符串、`redactions` 可选 JSON 数组）。幂等：**同一 `ANON_SECRET`** 下相同输入返回既有作业（200），换密钥则另开新作业（202） |
+| `GET` | `/jobs/{id}` | 查询状态 / 逐项错误 / 审计摘要 / 结果哈希 / 密钥指纹 |
+| `GET` | `/jobs/{id}/download` | 下载匿名化结果 ZIP（未完成返回 409，作业不存在返回 404） |
 | `GET` | `/policies` | 支持的策略版本、默认档案、遮挡框格式 |
 | `GET` | `/healthz` | 健康检查 |
+
+## 密钥轮换演练（持久化数据，可直接复验）
+
+作业 ID 与判重均以**密钥作用域**为准。作业 ID 为
+
+```
+sha256("dicom-anon-job:v2|" + key_fingerprint + "|" + input_sha256
+       + "|" + canonical(policy) + "|" + canonical(redactions))
+```
+
+的前 32 位，其中 `key_fingerprint = sha256("dicom-anon-key-fingerprint:v1|" + ANON_SECRET)`。
+指纹是不可逆摘要：数据库、审计与 ZIP 内 `manifest.json` 只保存它，**绝不保存明文密钥**。
+
+下面用 `docker compose` 在同一持久化卷上完整演练一次轮换（数值均为下文
+`secret-A` / `secret-B` 实跑所得，可原样复现）。
+
+**1）用密钥 A 启动并提交作业**
+
+```bash
+ANON_SECRET=secret-A docker compose up --build -d
+curl -s -X POST http://localhost:8000/jobs \
+  -F "file=@sample_input.zip" \
+  -F "policy=<examples/policy.json" \
+  -F "redactions=<examples/redactions.json"
+```
+
+```json
+{
+  "job_id": "880da8b99b3ccf9b7acb0bacd2dca15b",
+  "status": "queued",
+  "status_url": "/jobs/880da8b99b3ccf9b7acb0bacd2dca15b",
+  "detail": null,
+  "key_fingerprint": "57d8598384c89f4e875db3c5bf62e4df1e83a27d5bb56fc8242eb8b212e2b9e5"
+}
+```
+
+同密钥原样重提，返回 **200 + 同一 `job_id`**（仍复用）：
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/jobs \
+  -F "file=@sample_input.zip" -F "policy=<examples/policy.json" \
+  -F "redactions=<examples/redactions.json"
+# 200
+```
+
+**2）换成密钥 B，在同一数据卷上重启，原样重提**
+
+```bash
+ANON_SECRET=secret-B docker compose up -d   # 复用命名卷 dicom-anon-data
+curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost:8000/jobs \
+  -F "file=@sample_input.zip" -F "policy=<examples/policy.json" \
+  -F "redactions=<examples/redactions.json"
+```
+
+B 不会命中 A 的旧记录，返回 **202 + 独立新作业 `JOB_B`**：
+
+```json
+{"job_id":"c96a46feee1e99f43d8a196f492314c1","status":"queued",
+ "status_url":"/jobs/c96a46feee1e99f43d8a196f492314c1","detail":null,
+ "key_fingerprint":"a176471f323641812a69c9cdb3e25923cecc2bcd1e9a9e7171574311dc33d91e"}
+HTTP 202
+```
+
+**3）验证：B 产出独立审计与哈希，A 的旧作业仍可查询/下载**
+
+```bash
+# B 的状态：独立指纹、独立 ZIP 哈希、独立 UID 映射
+curl -s http://localhost:8000/jobs/c96a46feee1e99f43d8a196f492314c1
+#   status=done  key_fingerprint=a176471f…33d91e
+#   audit.output.zip_sha256 = 2c5f6f5f16833b3b1df43f4e90fcc89071986aa2b7d08fad00b35b734252585b
+#   Study UID = 2.25.41357652652960139871614046357511393935   （A 为 2.25.1613…23381，不同）
+
+# 同密钥 B 再提一次仍复用（200 + JOB_B）
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/jobs \
+  -F "file=@sample_input.zip" -F "policy=<examples/policy.json" \
+  -F "redactions=<examples/redactions.json"
+# 200
+
+# A 的旧 ID 仍可查询，结果原样保留（不会被当成 B 的结果）
+curl -s http://localhost:8000/jobs/880da8b99b3ccf9b7acb0bacd2dca15b
+#   status=done  key_fingerprint=57d85983…2b9e5
+#   result.sha256 = dbb74e23e65a0e50c1ee9aabc50d54acae10ced2179d068b74a2f3820f2810f9
+
+curl -s -o /tmp/a.zip http://localhost:8000/jobs/880da8b99b3ccf9b7acb0bacd2dca15b/download
+curl -s -o /tmp/b.zip http://localhost:8000/jobs/c96a46feee1e99f43d8a196f492314c1/download
+sha256sum /tmp/a.zip /tmp/b.zip
+# dbb74e23…2810f9  /tmp/a.zip   与 JOB_A 的 result.sha256 一致
+# 2c5f6f5f…52585b  /tmp/b.zip   与 JOB_B 的 result.sha256 一致；两者互不相同
+unzip -p /tmp/a.zip manifest.json | grep -o '"key_fingerprint": "[^"]*"'  # 57d85983… (A)
+unzip -p /tmp/b.zip manifest.json | grep -o '"key_fingerprint": "[^"]*"'  # a176471f… (B)
+```
+
+**升级自旧版本（无指纹记录）的行为**：旧版数据库在启动时自动迁移，新增
+`key_fingerprint` 列；旧作业该列为 `null`、沿用旧 32 位 ID，仍可正常查询和
+下载；由于新版作业 ID 带有 `v2` 密钥作用域，任何新提交都不可能命中这些旧行，
+因此旧密钥产物永远不会被误返给新密钥的请求。
 
 ## 匿名化策略（版本化）
 
@@ -261,11 +373,14 @@ assert str(leaf.ReferencedSOPSequence[0].ReferencedSOPInstanceUID).startswith("2
 值哈希均用 HMAC-SHA256 派生；输出统一编码为 Explicit VR Little Endian、
 固定文件元与 128 字节零前导；ZIP 条目按 `STUDY_xxxx/SERIES_xxxx/
 INSTANCE_xxxxx.dcm` 确定性命名、固定 1980-01-01 时间戳与压缩级别；
-`manifest.json` 键序固定。重复处理同一输入将得到逐字节相同的结果。
+`manifest.json` 键序固定，内含输入/策略哈希与密钥指纹。同一密钥下重复处理
+同一输入将得到逐字节相同的结果；轮换 `ANON_SECRET` 后指纹改变，作业判重
+重新开作用域，输出也随之不同（见上文「密钥轮换演练」）。
 
 ## 安全与合规提示
 
 - 本服务面向研究数据去标识化场景；输出是否满足具体法规（如 HIPAA
   Safe Harbor、GDPR）需由数据负责人评估， burned-in 文本建议配合遮挡框。
-- `ANON_SECRET` 决定映射可复现性，请妥善保管并仅在受信环境部署。
+- `ANON_SECRET` 决定映射可复现性，请妥善保管并仅在受信环境部署。轮换密钥
+  会让后续提交产出独立作业与结果；服务只持久化其 SHA-256 指纹，不留明文。
 - UID 映射表（审计中返回）本身属于敏感关联信息，请按研究数据治理要求保存。
