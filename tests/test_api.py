@@ -13,13 +13,14 @@ from pydicom import dcmread
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, JPEGBaseline
 
-from app.config import Settings
+from app.config import Settings, secret_fingerprint
 from app.dicom_ops import UIDMapper, compute_offset
 from app.engine import anonymize_zip
-from app.main import create_app
+from app.main import compute_job_id, create_app
 from app.policy import canonical_json
 
 SECRET = "test-secret"
+SECRET_B = "rotated-secret"
 BASE_POLICY = {
     "version": "1.0",
     "salt": "unit-test",
@@ -630,6 +631,159 @@ def test_different_policy_changes_output():
     _, result1, _, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
     _, result2, _, _ = anonymize_zip(payload, other_policy, None, SECRET)
     assert result1 != result2
+
+
+# ---------------------------------------------------------------------------
+# Secret rotation: dedup scope must match the secret the engine uses
+# ---------------------------------------------------------------------------
+@pytest.fixture()
+def rotating_apps(tmp_path):
+    """Two app instances sharing one persistent data dir, as a restart after
+    rotating ANON_SECRET would."""
+
+    def make(secret):
+        app = create_app(Settings(data_dir=str(tmp_path), secret=secret))
+        return TestClient(app)
+
+    client_a = make(SECRET)
+    client_b = make(SECRET_B)
+    with client_a, client_b:
+        yield client_a, client_b
+
+
+def test_job_id_includes_secret_scope():
+    payload = three_instance_zip()
+    digest = hashlib.sha256(payload).hexdigest()
+    id_a = compute_job_id(digest, BASE_POLICY, None, secret_fingerprint(SECRET))
+    id_b = compute_job_id(digest, BASE_POLICY, None, secret_fingerprint(SECRET_B))
+    assert id_a != id_b
+    # fingerprint is a non-reversible digest, not the plaintext secret
+    assert SECRET not in secret_fingerprint(SECRET)
+    assert secret_fingerprint(SECRET) != secret_fingerprint(SECRET_B)
+    # same secret resubmits keep the same id
+    assert compute_job_id(digest, BASE_POLICY, None, secret_fingerprint(SECRET)) == id_a
+
+
+def test_secret_rotation_creates_independent_job_and_result(rotating_apps):
+    client_a, client_b = rotating_apps
+    payload = three_instance_zip()
+
+    # first submission under secret A
+    resp_a1 = client_a.post(
+        "/jobs",
+        files={"file": ("input.zip", payload, "application/zip")},
+        data={"policy": json.dumps(BASE_POLICY)},
+    )
+    assert resp_a1.status_code == 202
+    id_a = resp_a1.json()["job_id"]
+    status_a = get_job(client_a, id_a)
+    assert status_a["status"] == "done"
+    assert status_a["secret_fingerprint"] == secret_fingerprint(SECRET)
+    zip_a = download(client_a, id_a)
+    sha_a = hashlib.sha256(zip_a).hexdigest()
+    assert status_a["result"]["sha256"] == sha_a
+
+    # identical resubmit under the same secret reuses the job
+    resp_a2 = client_a.post(
+        "/jobs",
+        files={"file": ("input.zip", payload, "application/zip")},
+        data={"policy": json.dumps(BASE_POLICY)},
+    )
+    assert resp_a2.status_code == 200
+    assert resp_a2.json()["job_id"] == id_a
+
+    # restart with ANON_SECRET=B and resubmit verbatim: new job, new id
+    resp_b = client_b.post(
+        "/jobs",
+        files={"file": ("input.zip", payload, "application/zip")},
+        data={"policy": json.dumps(BASE_POLICY)},
+    )
+    assert resp_b.status_code == 202, resp_b.text
+    id_b = resp_b.json()["job_id"]
+    assert id_b != id_a
+
+    status_b = get_job(client_b, id_b)
+    assert status_b["status"] == "done"
+    assert status_b["secret_fingerprint"] == secret_fingerprint(SECRET_B)
+    zip_b = download(client_b, id_b)
+    sha_b = hashlib.sha256(zip_b).hexdigest()
+
+    # independent audit and hash: B must not have received A's bytes
+    assert sha_b != sha_a
+    assert status_b["audit"]["output"]["zip_sha256"] == sha_b
+    assert status_b["audit"]["secret_fingerprint"] == secret_fingerprint(SECRET_B)
+
+    # the output was genuinely produced under B
+    _, expected_b, audit_b, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET_B)
+    assert zip_b == expected_b
+    assert sha_b == hashlib.sha256(expected_b).hexdigest()
+
+    # old job remains queryable and downloadable after rotation, still A's bytes
+    old = client_b.get(f"/jobs/{id_a}")
+    assert old.status_code == 200
+    assert old.json()["status"] == "done"
+    assert old.json()["secret_fingerprint"] == secret_fingerprint(SECRET)
+    legacy_dl = client_b.get(f"/jobs/{id_a}/download")
+    assert legacy_dl.status_code == 200
+    assert hashlib.sha256(legacy_dl.content).hexdigest() == sha_a
+
+    # manifest of each result carries its own secret scope
+    def manifest_fp(zbytes):
+        return json.loads(zipfile.ZipFile(io.BytesIO(zbytes)).read("manifest.json"))[
+            "secret_fingerprint"
+        ]
+
+    assert manifest_fp(zip_a) == secret_fingerprint(SECRET)
+    assert manifest_fp(zip_b) == secret_fingerprint(SECRET_B)
+
+
+def test_legacy_unfingerprinted_job_is_never_reused_after_rotation(tmp_path):
+    """A row written by the pre-fingerprint build (secret_fp NULL) stays
+    fetchable but cannot satisfy a new submission under any secret."""
+    from app.store import JobStore
+
+    db = JobStore(str(tmp_path / "jobs.db"))
+    legacy_id = "a" * 32
+    with db._conn:  # simulate an old-version row: no fingerprint
+        db._conn.execute(
+            "INSERT INTO jobs (job_id, status, created_at, updated_at, policy_json,"
+            " redactions_json, input_sha256, secret_fp) VALUES (?, 'done', 't', 't', '{}', NULL, ?, NULL)",
+            (legacy_id, "0" * 64),
+        )
+
+    # direct lookup/download of the old id still works
+    assert db.get(legacy_id) is not None
+    assert db.get(legacy_id)["secret_fp"] is None
+    # scoped lookups never bind it to a fingerprinted submission
+    assert db.find_scoped(legacy_id, secret_fingerprint(SECRET)) is None
+    assert db.find_scoped(legacy_id, secret_fingerprint(SECRET_B)) is None
+
+
+def test_old_database_is_migrated_on_start(tmp_path):
+    """A SQLite file created by the pre-fingerprint schema migrates and keeps
+    its legacy rows queryable."""
+    import sqlite3
+
+    db_path = str(tmp_path / "jobs.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT,"
+        " updated_at TEXT, policy_json TEXT NOT NULL, redactions_json TEXT, input_sha256 TEXT,"
+        " result_path TEXT, result_sha256 TEXT, audit_json TEXT, errors_json TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO jobs VALUES (?, 'done', 't', 't', '{}', NULL, ?, NULL, NULL, NULL, NULL)",
+        ("deadbeef" * 4, "0" * 64),
+    )
+    conn.commit()
+    conn.close()
+
+    from app.store import JobStore
+
+    store = JobStore(db_path)
+    row = store.get("deadbeef" * 4)
+    assert row is not None and row["secret_fp"] is None
+    assert store.find_scoped("deadbeef" * 4, secret_fingerprint(SECRET)) is None
 
 
 # ---------------------------------------------------------------------------

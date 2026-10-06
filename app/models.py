@@ -22,7 +22,7 @@ class JobCreated(BaseModel):
 
 class ResultInfo(BaseModel):
     sha256: str
-    size_bytes: int
+    size_bytes: Optional[int] = None
     download_url: str
 
 
@@ -34,6 +34,9 @@ class JobStatus(BaseModel):
     policy_version: Optional[str] = None
     policy_sha256: str
     input_sha256: str
+    #: Fingerprint of the ANON_SECRET scope the job was (or will be) processed
+    #: under; null only for legacy rows created before fingerprinted dedup.
+    secret_fingerprint: Optional[str] = None
     errors: Optional[list[ErrorItem]] = None
     audit: Optional[dict[str, Any]] = None
     result: Optional[ResultInfo] = None
